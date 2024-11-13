@@ -1,0 +1,273 @@
+name: 'mgha: KeyVault Creator'
+# This action is meant to ONLY be called from orion-platform-api calls
+
+on:
+  workflow_call:
+    inputs:
+      rgname:
+        description: 'RG Name'
+        required: true
+        type: string                       
+      kvname:
+        description: 'Keyvault Name'
+        required: false
+        type: string
+      kvtype:
+        description: 'KV Type'
+        required: true
+        type: string     
+      aaid:
+        description: 'AA ID'
+        required: true
+        type: string  
+    outputs:
+      rgname: 
+        value: ${{ jobs.setup-job.outputs.rgname }}      
+      kvname: 
+        value: ${{ jobs.setup-job.outputs.kvname }}
+      kvtype: 
+        value: ${{ jobs.setup-job.outputs.kvtype }}
+      errcode: 
+        value: ${{ jobs.setup-job.outputs.errcode }}
+      errtext: 
+        value: ${{ jobs.setup-job.outputs.errtext }} 
+      dbapistatus: 
+        value: ${{ jobs.setup-job.outputs.dbapistatus }} 
+
+jobs:
+  setup-job:
+    defaults:
+      run:
+        shell: bash
+        working-directory: './provision/bicep/keyvault/'
+    runs-on: ubuntu-latest
+    name: Setup Job
+    environment: production
+    env:
+      errcode: 0
+      errtext: "No Errors"   
+    outputs:
+      rgname: ${{ steps.finalize.outputs.rgname }}      
+      kvname: ${{ steps.finalize.outputs.kvname }}
+      kvtype: ${{ steps.finalize.outputs.kvtype }}
+      errcode: ${{ steps.finalize.outputs.errcode }}
+      errtext: ${{ steps.finalize.outputs.errtext }} 
+      dbapistatus: ${{ steps.finalize.outputs.dbapistatus }}      
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Store KVName in DB (Deploying)
+      id: storekvdep
+      continue-on-error: true
+      uses: ./.github/actions/orion-api
+      with:
+        apigee_url: ${{ secrets.APIGEE_TOKEN_URL }}
+        apigee_client_id: ${{ secrets.APIGEE_CLIENT_ID }}
+        apigee_client_secret: ${{ secrets.APIGEE_CLIENT_SECRET }}
+        api_url: ${{ secrets.API_URL }}
+        api_suffix: '/api/v2/appcodes/components'
+        method: 'POST' 
+        body: '{"resource_group_name": "${{ github.event.inputs.rgname }}","name": "${{ github.event.inputs.kvname }}","component_type_code": "KV","status": "DEPLOYING", "creator_id": "${{ github.event.inputs.AAID }}" }'
+        environment: 'P'
+        attempt_limit: 5
+
+    - name: Log into Azure
+      id: azurelogin
+      uses: azure/login@v1
+      with:
+        creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ vars.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ vars.AZURE_TENANT_ID }}"}'
+
+    - name: 'Setup Workflow and Validate Variables'
+      id: buildkv
+      shell: pwsh
+      run: |
+        Write-Output "=== Begin buildkv ==="
+        $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss TZ: K"
+        Write-Output "Start Date: $now"
+        Write-Output "Current Directory: $((Get-Location).Path)"
+
+        # Get inputs from caller
+        $rgname = "${{ github.event.inputs.rgname }}"
+        $rgname = $rgname.ToLower()
+        Write-Output "RG Name: $rgname"  
+
+        # parse rgname for values
+        If ($null -eq $rgname) {
+          $errtext = "ERROR: Missing RG Name from caller: - aborting"
+          Write-Output $errtext
+          echo "errcode=101A" >> $env:GITHUB_ENV
+          echo "errtext=$errtext" >> $env:GITHUB_ENV
+          exit 1
+        }
+        Else {
+          If ($rgname.Contains("ba-n-")) {
+            $spoke = "aa-ba-nonprod-spoke"
+          }
+          ElseIf ($rgname.Contains("ba-p-")) {
+            $spoke = "aa-ba-prod-spoke"
+          }
+          Else {
+            $errtext = "ERROR: Bad RG Name from caller; cannot determine Subscription from name: - aborting"
+            Write-Output $errtext
+            echo "errcode=101B" >> $env:GITHUB_ENV
+            echo "errtext=$errtext" >> $env:GITHUB_ENV
+            exit 1
+          }
+        }
+
+        If ($rgname.Contains("ba-n-")) {
+            $objectId = "25a6dad9-dced-473d-9964-039dcc7d9345"
+            $keysPermissions = ['all']
+            $secretsPermissions = ['all']
+            $certificatesPermissions = ['all']
+        }
+
+        ElseIf ($rgname.Contains("ba-p-")) {
+            $objectId = "730daf14-9a76-4864-92b5-0dea0c741624"
+            $keysPermissions = ['all']
+            $secretsPermissions = ['all']
+            $certificatesPermissions = ['all']
+        }
+
+
+        # kvname and kvtype reference
+        $kvname = "${{ github.event.inputs.kvname }}"
+        $kvtype = "${{ github.event.inputs.kvtype }}"
+
+        If ($kvname.Length -eq 0) {
+          If ($kvtpe -eq "RG") {
+            $kvname = $rgname.Substring(0, $rgname.Length - 2) + 'kv'
+          }
+          If ($kvtpe -eq "AAID") {
+            $kvname = $rgname.Substring(0,11) + $aaid + "-kv"
+          }
+          If ($kvtpe -eq "ML") {
+            $kvname = $rgname.Substring(0, $rgname.Length - 2) + "ml-kv"
+          }
+        }
+        
+        Write-Output "KV Name: $($kvname)"
+
+        If ($kvname.Length > 24) {
+            $errtext = "ERROR: Bad KV Name $($kvname); cannot be greather than 24 characters: - aborting"
+            Write-Output $errtext
+            echo "errcode=101C" >> $env:GITHUB_ENV
+            echo "errtext=$errtext" >> $env:GITHUB_ENV
+            exit 1
+        }
+
+        
+        Write-Output "`nUsing the following values:"
+        Write-Output "`tSpoke: $spoke"
+        Write-Output "`tRG Name: $rgname"
+        Write-Output "`tMI Name: $kvname"
+        $dname = "KV-" + $(Get-Date -UFormat '%Y%b%d%H%M%S')
+        $template = "./provision/bicep/keyvault/main.bicep"
+        Write-Output "`tDeployment Name: $dname"
+
+        $subscription = (az account show | ConvertFrom-Json).name
+        Write-Output "`nCurrent Subscription: $subscription"
+        $retry = 5
+        $loop = 0
+
+        Do {
+          $loop = $loop + 1
+          Write-Output "### Attempt #$loop to switch to subscription $spoke"
+          az account set -n $spoke
+          $subscription = (az account show | ConvertFrom-Json).name
+          Write-Output "Current Subscription: $subscription"
+        } While ($subscription -ne $spoke -and $loop -le $retry )       
+
+        If ($subscription -ne $spoke ) {
+          $errtext = "ERROR: Error switching to $spoke"
+          Write-Output $errtext
+          echo "errcode=301" >> $env:GITHUB_ENV
+          echo "errtext=$errtext" >> $env:GITHUB_ENV 
+          exit 1
+        }       
+
+        Write-Output "Subscription: $subscription"
+        Write-Output "==============="
+        Write-Output "`nAbout to execute Bicep: "
+        $command = "az deployment group create --name $dname --resource-group $rgname --template-file main.bicep -p keyVaultName=$kvname objectId=$objectId keysPermissions=$keysPermissions secretsPermissions=$secretsPermissions certificatesPermissions=$certificatesPermissions "
+        Write-Output "`t${command}"
+        $result = Invoke-Expression $command -EA SilentlyContinue -EV biceperr
+        $resulttab = $result | ConvertFrom-Json
+        Write-Output "`n--- Result JSON ---"
+        Write-Output $result
+        Write-Output "------"
+
+        If ($null -eq $result) {
+          $errtext = "ERROR: Bicep had an unknown error building the keyvault; result is empty"
+          Write-Output $biceperr
+          echo "errcode=201" >> $env:GITHUB_ENV
+          echo "errtext=$biceperr" >> $env:GITHUB_ENV
+          $sanameout = "N/A"
+          $skuout = "N/A"
+          dbapistatus = "FAILED"
+        }
+        Else {
+          Write-Output "`n--- Result Table ---"
+          Write-Output $resulttab
+          Write-Output "------"
+          $kvnameout = $resulttab.properties.outputs.keyVaultName.value
+        }
+
+        Write-Output "========="
+        Write-Output "RG Name: $rgname"
+        echo "rgname=$rgname" >> $env:GITHUB_OUTPUT
+        Write-Output "KV Name: $kvnameout"
+        echo "kvname=$kvnameout" >> $env:GITHUB_OUTPUT
+
+        Write-Output "`n--- BICEP ERR.TXT ---"
+
+        If ($null -eq $biceperr -or $biceperr -ne ""){
+          Write-Output $biceperr
+          echo "errcode=202" >> $env:GITHUB_ENV
+          echo "errtext=$biceperr" >> $env:GITHUB_ENV
+          $dbapistatus = "FAILED"
+        } 
+        Else {
+          Write-Output "`tNo Errors Found"
+          $dbapistatus = "SUCCESS"
+        }
+
+        Write-Output "------"
+        Write-Output "`nDBAPI STATUS: $dbapistatus"
+        echo "dbapistatus=$dbapistatus" >> $env:GITHUB_OUTPUT
+        Write-Output "=== End buildkv ==="
+
+    - name: Store KVName in DB (Final)
+      id: storekvfinal
+      continue-on-error: true
+      uses: ./.github/actions/orion-api
+      with:
+        apigee_url: ${{ secrets.APIGEE_TOKEN_URL }}
+        apigee_client_id: ${{ secrets.APIGEE_CLIENT_ID }}
+        apigee_client_secret: ${{ secrets.APIGEE_CLIENT_SECRET }}
+        api_url: ${{ secrets.API_URL }}
+        api_suffix: '/api/v2/appcodes/components'
+        method: 'POST' 
+        body: '{"resource_group_name": "${{ github.event.inputs.rgname }}","name": "${{ github.event.inputs.kvname }}","component_type_code": "KV","status": "${{ steps.buildsa.outputs.dbapistatus }}", "creator_id": "${{ github.event.inputs.AAID }}" }'
+        environment: 'P'
+        attempt_limit: 5
+
+    - name: Finalize Outputs
+      id: finalize   
+      run: |  
+        errcode="${{ env.errcode }}"
+        echo "errcode=$errcode"
+        echo "errcode=$errcode" >> $GITHUB_OUTPUT
+        errtext="${{ env.errtext }}"
+        echo "errtext=$errtext"
+        echo "errtext=$errtext" >> $GITHUB_OUTPUT
+        rgname="${{ steps.buildkv.outputs.rgname }}"
+        echo "rgname=$rgname"
+        echo "rgname=$rgname" >> $GITHUB_OUTPUT
+        kvname="${{ steps.buildkv.outputs.saname }}"
+        echo "kvname=$kvname"
+        echo "kvname=$kvname" >> $GITHUB_OUTPUT
+        dbapistatus=${{ steps.buildkv.outputs.dbapistatus }}
+        echo "dbapistatus=$dbapistatus"
+        echo "dbapistatus=$dbapistatus" >> $GITHUB_OUTPUT

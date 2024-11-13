@@ -1,0 +1,189 @@
+name: 'Create Keyvault'
+
+on:
+  workflow_dispatch:
+    inputs:
+      rgname:
+        description: 'RG Name'
+        required: true
+        type: string                   
+      kvname:
+        description: 'Keyvault Name'
+        required: false
+        type: string
+      kvtype:
+        description: 'KV Type'
+        required: true
+        type: string
+        default: 'RG'
+      aaid:
+        description: 'AA ID'
+        required: true
+        type: string  
+
+jobs:
+  setup-job:
+    defaults:
+      run:
+        shell: bash
+        working-directory: './provision/bicep/keyvault/'
+    runs-on: ubuntu-latest
+    name: Setup Job
+    env:
+      SPOKE: ''
+      ERRCODE: 0
+      ERRTEXT: ''
+    outputs:
+      start: ${{ steps.prepdata.outputs.start }}
+      starts: ${{ steps.prepdata.outputs.starts }}
+      spoke: ${{ steps.prepdata.outputs.spoke }}
+      errcode: ${{ env.errcode }}
+      errtext: ${{ env.errtext }}
+    steps:
+    - name: Clean Workspace
+      uses: AutoModality/action-clean@v1
+
+    - name: Checkout
+      uses: actions/checkout@v3
+  
+    - name: Get TowerAPI Token
+      uses: actions/checkout@v3 # Checks out the action
+      with:
+        repository: AAInternal/tower-action
+        ref: v1.1.1 # Current release tag
+        path: ./.github/actions/tower-action
+        token: "${{ secrets.AAINTERNAL_READONLY_PAT }}" # Access token
+
+    - name: Call TnT Tower
+      uses: ./.github/actions/tower-action
+      continue-on-error: true
+      with:
+        tower_url: ${{ secrets.TOWER_URL }} # AAInternal User Credential
+        token_url: ${{ secrets.TOWER_TOKEN_URL }} # AAInternal Organizational secret
+        client_id: ${{ secrets.TOWER_USR }} # AAInternal User Credential
+        client_secret: ${{ secrets.TOWER_PWD }} # AAInternal User Credential
+        archer_short_name: 'Orion'
+        squad360_id: '338701'
+
+    - name: Prepare Data Values
+      id: prepata
+      continue-on-error: true
+      shell: pwsh
+      run: |
+
+        Write-Output "=== Begin prepdata Step ==="
+        $start = Get-Date -UFormat '%Y-%m-%dT%H:%M:%S%z'
+        $starts = Get-Date -UFormat '%s'
+        Write-Output "-- Start Time: $start"
+        echo "start=$start" >> $env:GITHUB_OUTPUT
+        echo "starts=$starts" >> $env:GITHUB_OUTPUT
+        $aaid = "${{ github.event.inputs.aaid }}"
+        Write-Output "AAID: $aaid"
+
+        If ($null -eq $aaid -or $aaid -eq "") {
+          $spoke = "ERROR"
+          $errtext = "ERROR: Missing AAID from caller: - aborting"
+          Write-Output $errtext
+          echo "errcode=W101" >> $env:GITHUB_ENV
+          echo "errtext=$errtext" >> $env:GITHUB_ENV
+          exit 1
+        }
+
+        $rgname = "${{ github.event.inputs.rgname }}"
+        Write-Output "RG Name: $rgname"
+
+        If ($rgname.Contains("ba-n")) {
+          $spoke = "aa-ba-nonprod-spoke"
+        }
+        ElseIf ($rgname.Contains("ba-p")) {
+          $spoke = "aa-ba-prod-spoke"
+        }
+        Else {
+          $spoke = "ERROR"
+          $errtext = "ERROR: Invalid Spoke: $spoke using RG Name $rgname from caller: - aborting"
+          Write-Output $errtext
+          echo "errcode=W102" >> $env:GITHUB_ENV
+          echo "errtext=$errtext" >> $env:GITHUB_ENV
+          exit 1
+        }
+
+        Write-Output "SPOKE: $spoke"
+        echo "spoke=$spoke" >> $env:GITHUB_OUTPUT
+
+        $kvname = "${{ github.event.inputs.kvname }}"
+        $kvtype = "${{ github.event.inputs.kvtype }}"
+
+        If ($kvname.Length -eq 0) {
+          If ($kvtpe -eq "RG") {
+            $kvname = $rgname.Substring(0, $rgname.Length - 2) + 'kv'
+          }
+          If ($kvtpe -eq "AAID") {
+            $kvname = $rgname.Substring(0,11) + $aaid + "-kv"
+          }
+          If ($kvtpe -eq "ML") {
+            $kvname = $rgname.Substring(0, $rgname.Length - 2) + "ml-kv"
+          }
+        }
+        
+        Write-Output "KV Name: $($kvname)"
+        Write-Output "=== End prepdata Step ==="
+  build-kv:
+    if: needs.setup-job.outputs.errcode == 0
+    needs: [ setup-job ]
+    uses: AAInternal/orion-platform-api/.github/workflows/mgha_kv.yml@main
+    with:
+      rgname: ${{ github.event.inputs.rgname }}
+      kvname: ${{ github.event.inputs.kvname }}
+      kvtype: ${{ github.event.inputs.kvtype }}
+      aaid: ${{ github.event.inputs.aaid }}
+    secrets: inherit
+
+  wrapup:
+    needs: [ setup-job, build-kv ]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      spoke: ${{ needs.setup-job.outputs.spoke }}
+      rgname: ${{ github.event.inputs.rgname }}
+      kvname: ${{ needs.build-kv.outputs.saname }}
+      kvtype: ${{ github.event.inputs.sasku }}
+      aaid: ${{ github.event.inputs.aaid }}
+      dbapistatus: ${{ needs.build-kv.outputs.dbapistatus }}
+      errcode: ${{ needs.build-kv.outputs.errcode }}
+      errtext: ${{ needs.build-kv.outputs.errtext }}
+      start: ${{ needs.setup-job.outputs.start }}
+      starts: ${{ needs.setup-job.outputs.starts }}
+    steps:
+    - name: Clean Workspace
+      uses: AutoModality/action-clean@v1
+
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Prep Final Output
+      id: finaloutput
+      shell: pwsh
+      run: |
+        Write-Output "=== Begin finaloutput Step ==="
+        $start = "${{ env.start }}"
+        $starts = ${{ env.starts }}
+        $stop = Get-Date -UFormat '%Y-%m-%dT%H:%M:%S%z'
+        $stops = Get-Date -UFormat %s
+        Write-Output "START DATE: $start"
+        Write-Output "STOP DATE: $stop"
+        Write-Output "`nSTART TIME: $starts"
+        Write-Output "STOP TIME: $stops"
+        $ttl = $stops - $starts
+        $ts = [timespan]::fromseconds($ttl)
+        Write-Output "TOTAL TIME: $('{0:hh\:mm\:ss}' -f $ts)"
+
+        echo "start=$start" >> $GITHUB_OUTPUT
+        echo "starts=$starts" >> $GITHUB_OUTPUT
+        echo "stop=$stop" >> $GITHUB_OUTPUT
+        echo "stops=$stops" >> $GITHUB_OUTPUT
+        echo "ttl=$ttl" >> $GITHUB_OUTPUT
+
+        Write-Output "`n--- Status Codes ---"
+        Write-Output "`tJob Status: ${{ env.errcode }}"
+        Write-Output "`tDBAPI Status: ${{ env.dbapistatus }}"
+        Write-Output "=== End finaloutput Step ==="

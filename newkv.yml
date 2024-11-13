@@ -1,0 +1,466 @@
+name: 'Create mgha Keyvault'
+
+on:
+  push:
+    branches:
+      - kv_api_test
+    paths:
+    - 'provision/bicep/keyvault/newkvvars/newkvfile.txt'
+  workflow_dispatch:
+
+jobs:
+  setup-job:
+    defaults:
+      run:
+        shell: bash
+        working-directory: './provision/bicep/keyvault/'
+    runs-on: ubuntu-latest
+    name: Setup Job
+    env:
+      SPOKE: ''
+      ERRCODE: 0
+      ERRTEXT: ''
+    outputs:
+      spoke: ${{ steps.getdata.outputs.spoke }}
+      rgn: ${{ steps.getdata.outputs.rgn }}
+      sku: ${{ steps.getdata.outputs.sku }}
+      kv: ${{ steps.getdata.outputs.kv }}
+      location: ${{steps.getdata.outputs.location}}
+      STARTTIME: ${{ steps.getdata.outputs.STARTTIME }}
+      STARTTIMES: ${{ steps.getdata.outputs.STARTTIMES }}
+      EMAILADDR: ${{ steps.emailout.outputs.emailaddr }}
+      SAFILE: ${{ steps.getdata.outputs.SAFILE }}
+      FILEJSON: ${{ steps.getdata.outputs.FILEJSON }}
+      AAID: ${{ steps.getdata.outputs.AAID }}
+      ERRCODE: ${{ env.ERRCODE }}
+      ERRTEXT: ${{ env.ERRTEXT }}
+    steps:
+    - name: Clean Workspace
+      uses: AutoModality/action-clean@v1
+
+    - name: Checkout
+      uses: actions/checkout@v3
+  
+    - name: Get TowerAPI Token
+      uses: actions/checkout@v3 # Checks out the action
+      with:
+        repository: AAInternal/tower-action
+        ref: v1.1.1 # Current release tag
+        path: ./.github/actions/tower-action
+        token: "${{ secrets.AAINTERNAL_READONLY_PAT }}" # Access token
+
+    - name: Call TnT Tower
+      uses: ./.github/actions/tower-action
+      continue-on-error: true
+      with:
+        tower_url: ${{ secrets.TOWER_URL }} # AAInternal User Credential
+        token_url: ${{ secrets.TOWER_TOKEN_URL }} # AAInternal Organizational secret
+        client_id: ${{ secrets.TOWER_USR }} # AAInternal User Credential
+        client_secret: ${{ secrets.TOWER_PWD }} # AAInternal User Credential
+        archer_short_name: 'Orion'
+        squad360_id: '338701'
+
+    - name: Get Pipeline Data Values
+      id: getdata
+      continue-on-error: true
+      run: |
+        echo "=== Begin getdata Module ==="
+        EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+        start=$(date +'%Y-%m-%dT%H:%M:%S%z')
+        starts=$(date +%s)
+        echo "-- Start Time: $start"
+        echo "STARTTIME=$start" >> $GITHUB_OUTPUT
+        echo "STARTTIMES=$starts" >> $GITHUB_OUTPUT
+
+        filename=$(cat ./newkvvars/newkvfile.txt | grep filename: | sed 's/filename://g' | xargs)
+        kvfile="$(cat ./newkvvars/newkvfile.txt )"
+        
+        echo -e "-- KV File Contents: \n------\n$kvfile"
+        echo "------"
+        echo "KVFILE<<$EOF" >> $GITHUB_OUTPUT
+        echo "$kvfile" >> $GITHUB_OUTPUT
+        echo "$EOF" >> $GITHUB_OUTPUT
+
+        if [[ -z $filename ]]
+        then
+          errtext="ERRTEXT=Missing filename, referenced in newkvfile.txt"
+          echo $errtext
+          echo "ERRCODE=100" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          exit 1
+        fi
+      
+        echo "-- Filename: ${filename}"
+        aaid=$(cat ./newkvvars/newkvfile.txt | grep AAID | sed 's/#SUBMITTER-AAID//g' | xargs)
+
+        if [[ -z $aaid ]]
+        then
+          errtext="ERRTEXT=Missing AAID referenced, in newkvfile.txt"
+          echo $errtext
+          echo "ERRCODE=100B" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          exit 1
+        fi
+        
+        echo "-- AAID: $aaid"
+        filejson=$(cat ./newkvvars/$filename)
+        echo "FILEJSON<<$EOF" >> $GITHUB_OUTPUT
+        echo "$filejson" >> $GITHUB_OUTPUT
+        echo "$EOF" >> $GITHUB_OUTPUT
+
+        if [[ -z $filejson ]]
+        then
+          errtext="Empty File: $filejson"
+          echo $errtext
+          echo "ERRCODE=101" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          exit 1
+        fi
+
+        echo -e "-- File JSON Contents: \n------\n$filejson"
+        echo "------"        
+        rgn=$(echo $filejson | jq .resourceGroupName | sed 's/\"//g')
+        sku=$(echo $filejson | jq .keyVaultSku | sed 's/\"//g')
+        location=$(echo $filejson | jq .aaLocation | sed 's/\"//g')
+        keyVaultName=$(echo $filejson | jq .keyVaultName | sed 's/\"//g')
+        # storageName=$(echo $filejson | jq .storageName | sed 's/\"//g')
+        # storageName=$(echo ${rgn:0:10} | sed 's/-z//' | sed 's/-//')stg$storageName
+
+        if [[ -z $rgn ]] 
+        then
+          errtext="Missing Resource Group Name in $filejson"
+          echo $errtext
+          echo "ERRCODE=102" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          exit 1
+        elif [[ $rgn == *'-n-'* ]] 
+        then
+          spoke='nonprod'
+        elif [[ $rgn == *'-p-'* ]]
+        then
+          spoke='production'
+        else
+          errtext="+++ ERROR: Bad RG Name: $rgn"
+          echo $errtext
+          echo "ERRCODE=103" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          exit 1
+        fi
+        
+        echo "-- RG Name: $rgn passed validation. Using $spoke"
+        echo "SPOKE=$spoke" >> $GITHUB_ENV
+        
+        
+        if [[ -z $keyVaultName ]] 
+        then
+          errtext="Missing Keyvault Name in $filejson"
+          echo $errtext
+          echo "ERRCODE=106" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          exit 1
+        elif [ ${#keyVaultName} -gt 24 ] 
+        then
+          errtext="Keyvault Name is too long. It must be less than 25 characters long."
+          echo $errtext
+          echo "ERRCODE=107" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          exit 1
+        else
+          echo "-- Keyvault Name: $keyVaultName passed validation."
+        fi
+
+
+        if [[ $location == "eastus" ]]
+        then
+          loccode="zeaus"
+        elif [[ $location == "westus" ]]
+        then
+          loccode="zweus"
+        else
+          echo "ERROR: Bad aa_location: $location - aborting"
+          echo "ERRCODE=101" >> $GITHUB_ENV
+          echo "ERRTEXT=Bad Location: $location" >> $GITHUB_ENV 
+        fi        
+
+        echo "-- Spoke: $spoke"
+        echo "spoke=$spoke" >> $GITHUB_OUTPUT
+        echo "-- RGN: $rgn"
+        echo "rgn=$rgn" >> $GITHUB_OUTPUT
+        echo "-- KV: $keyVaultName"
+        echo "kv=$keyVaultName" >> $GITHUB_OUTPUT          
+        echo "-- AAID: $aaid"
+        echo "aaid=$aaid" >> $GITHUB_OUTPUT
+        echo "-- Location: $location"
+        echo "location=$location" >> $GITHUB_OUTPUT
+        echo "-- ERRCODE: $ERRCODE"
+        echo "ERRCODE=$ERRCODE" >> $GITHUB_ENV
+        echo "ERRTEXT: $ERRTEXT"
+        echo "ERRTEXT=$ERRTEXT" >> $GITHUB_ENV
+        echo "=== End getdata Module ==="
+    
+    - name: Get Email Address for AAID
+      id: getemail
+      continue-on-error: true
+      if: steps.getdata.outputs.AAID != ''
+      uses: ./.github/actions/orion-api
+      with:
+        apigee_url: 'https://api.aa.com/edgemicro-auth/token'
+        apigee_client_id: ${{ secrets.USERMAP_ID }}
+        apigee_client_secret: ${{ secrets.USERMAP_SECRET }}
+        api_url: 'https://dt-n-zeaus-usermap-mgw2-ap.azurewebsites.net/usermap/find?user=${{ steps.getdata.outputs.aaid }}'
+        api_suffix: ''
+        method: 'GET' 
+        body: ''
+        environment: 'p'
+        attempt_limit: 5
+
+    - name: Show Email Lookup Response
+      id: emailout
+      continue-on-error: true
+      run: |
+        aaid=${{ steps.getdata.outputs.aaid }}
+        echo "====="
+        echo "AAID: ${aaid}"
+        echo "=== getemail outputs ==="
+        resp='${{ steps.getemail.outputs.response }}'
+        echo "RESPONSE: $resp"
+        echo "======"
+        email=$(echo -e $resp | jq '.email_id')
+        
+        if [[ -z $aaid ]]
+        then
+          echo "ERROR: Missing AAID in newkvfile.txt; skipped getemail step"
+          email='parag.aptondikar@aa.com'
+          echo "Setting Email to $email"
+        else  
+          if [[ -z $email ]]
+          then
+            email='${aaid}@corpaa.aa.com'
+            echo "ERROR: AAID: ${aaid} does not have an email address in Runway/Usermap"
+            echo "Setting Email to $email"   
+          fi
+        fi
+
+        echo "Email: $email"
+        echo "emailaddr=$email" >> $GITHUB_OUTPUT
+        echo "====="
+
+  bicep-apply:
+    needs: [ setup-job ]
+    if: needs.setup-job.outputs.ERRCODE == 0
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    environment: 
+      name: ${{ needs.setup-job.outputs.spoke }}
+    env:
+      ERRCODE: ${{ needs.setup-job.outputs.ERRCODE }}
+      ERRTEXT: ${{ needs.setup-job.outputs.ERRTEXT }}
+      SPOKE: ${{ needs.setup-job.outputs.spoke }}
+      STARTTIME: ${{ needs.setup-job.outputs.STARTTIME }}
+    outputs:
+      rg: ${{ steps.buildkv.outputs.resourceGroupName }}
+      kvName: ${{ steps.buildkv.outputs.keyVaultName }}
+      ERRCODE: ${{ env.ERRCODE }}  
+      ERRTEXT: ${{ env.ERRTEXT }}
+      rgid: ${{ steps.apiresp.outputs.rgid }}
+      compname: ${{ steps.apiresp.outputs.compname }}
+      comptype: ${{ steps.apiresp.outputs.comptype }}
+      status: ${{ steps.apiresp.outputs.status }}
+      statusr: ${{ steps.apiresp.outputs.statusr }}
+      props: ${{ steps.apiresp.outputs.props }}
+      apiresponse: ${{ steps.apiresp.outputs.response }}
+      bicepstatus: ${{ steps.buildkv.outputs.bicepstatus }}
+      dbstatus: ${{ steps.apiresp.outputs.dbstatus }}
+    steps:
+    - name: Clean Workspace
+      uses: AutoModality/action-clean@v1
+
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Get Start Date and Set DB Message
+      id: startDate        
+      run: |
+        echo "STARTDATE=$(date +'%Y%m%dT%H%M%S%Z')" >> $GITHUB_OUTPUT
+    
+    - name: Store KVName in DB (Deploying)
+      id: storekvdep
+      continue-on-error: true
+      uses: ./.github/actions/orion-api
+      with:
+        apigee_url: ${{ secrets.APIGEE_TOKEN_URL }}
+        apigee_client_id: ${{ secrets.APIGEE_CLIENT_ID }}
+        apigee_client_secret: ${{ secrets.APIGEE_CLIENT_SECRET }}
+        api_url: ${{ secrets.API_URL }}
+        api_suffix: '/api/v2/appcodes/components'
+        method: 'POST' 
+        body: '{"resource_group_name": "${{ needs.setup-job.outputs.rgn }}","name": "${{ needs.setup-job.outputs.kv }}","component_type_code": "KV","status": "DEPLOYING", "creator_id": "${{ needs.setup-job.outputs.AAID }}" }'
+        environment: 'P'
+        attempt_limit: 5
+
+    - name: Log into Azure
+      id: azurelogin
+      uses: azure/login@v1
+      with:
+        creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ vars.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ vars.AZURE_TENANT_ID }}"}'
+
+    - name: Build Keyvault
+      id: buildkv
+      continue-on-error: true
+      run: |
+        echo "=== Begin buildkv Step ==="
+        rgn=${{ needs.setup-job.outputs.rgn }}
+        template="./provision/bicep/keyvault/main.bicep"
+        kv=${{ needs.setup-job.outputs.kv }}
+
+        result=$(az deployment group create --resource-group $rgn --template-file $template --parameters keyVaultName=$kv ) > ./out.txt 2> err.txt
+
+        if [[ -z result ]]
+        then
+          bicepstatus="error"
+          errtext="Bicep had an unknown error building the keyvault; result is empty"
+          echo "--- ERROR: $errtext"
+          echo "ERRCODE=201" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          
+          resourceGroupName=""
+          keyVaultName""
+
+        else
+          echo "--- az deployment result ---"
+          echo $result
+          echo "------"
+
+          echo "--- az deployment result.properties.outputs ---"
+          echo $result | jq .properties.outputs
+          echo "------"
+
+          resourceGroupName=$(echo $result | jq .properties.outputs.resourceGroupName.value)
+          keyVaultName=$(echo $result | jq .properties.outputs.keyVaultName.value)
+        fi
+
+        errcount=$(wc -c err.txt | awk '{print $1}')
+
+        if [ $errcount == 0 ]
+        then
+          echo "--- No Bicep errors reported"
+          bicepstatus="SUCCESS"
+        else
+          bicepstatus="ERROR"
+          dupe=$(cat err.txt | grep "KeyvaultAlreadyTaken")
+
+          if [ $#dupe != 0 ]
+          then
+            errtext="The keyvault named test is already taken."
+            echo "--- ERROR: $errtext"
+            echo "ERRCODE=202" >> $GITHUB_ENV
+            echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          else
+            errtext="$(cat err.txt)"
+            echo "--- ERROR: $errtext"
+            echo "ERRCODE=203" >> $GITHUB_ENV
+            echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+          fi
+        fi
+
+        if [ ${{ env.ERRCODE }} == 0 ]
+        then
+          DBMSG="SUCCESS"
+        else
+          DBMSG="FAILED"
+        fi
+
+        echo "resourceGroupName=$resourceGroupName" >> $GITHUB_OUTPUT
+        echo "keyVaultName=$keyVaultName" >> $GITHUB_OUTPUT
+        echo "DBMSG=$DBMSG" >> $GITHUB_OUTPUT
+        echo "bicepstatus=$bicepstatus" >> $GITHUB_OUTPUT
+        echo "=== End buildkv Step ==="
+
+    - name: Store KVName in DB (SUCCESS)
+      id: storekv
+      continue-on-error: true
+      uses: ./.github/actions/orion-api
+      with:
+        apigee_url: ${{ secrets.APIGEE_TOKEN_URL }}
+        apigee_client_id: ${{ secrets.APIGEE_CLIENT_ID }}
+        apigee_client_secret: ${{ secrets.APIGEE_CLIENT_SECRET }}
+        api_url: ${{ secrets.API_URL }}
+        api_suffix: '/api/v2/appcodes/components'
+        method: 'POST' 
+        body: '{"resource_group_name": "${{ needs.setup-job.outputs.rgn }}","name": "${{ needs.setup-job.outputs.kv }}","component_type_code": "KV","status": "${{ steps.buildkv.outputs.DBMSG }}", "creator_id": "${{ needs.setup-job.outputs.AAID }}" }'        
+        environment: 'P'
+        attempt_limit: 5
+    
+    - name: Print API Response
+      id: apiresp
+      continue-on-error: true
+      run: |
+        echo "=== Begin apiresp Step ==="
+        resp=${{ steps.storekv.outputs.response }}
+        echo "Response: $resp"
+
+        if [[ -z $resp ]]
+        then
+          dbstatus="ERROR"
+          echo "ERROR 401: Invalid Store Component API Response"
+          status="Error"
+          rgname="${{ steps.buildkv.outputs.resourceGroupName }}"
+          kvname="${{ steps.buildkv.outputs.keyVaultName }}"
+          echo "ERRCODE=401" >> $GITHUB_ENV
+          echo "ERRTEXT=ERROR: Invalid Store Component API Response" >> $GITHUB_ENV
+        else
+          dbstatus="SUCCESS"
+          resp='${{ steps.storesa.outputs.response }}'
+          rgid=$(echo $resp | jq .resource_group_id)
+          compname=$(echo $resp | jq .name)
+          comptype=$(echo $resp | jq .component_type_code)
+          status=$(echo $resp | jq .status)
+          statusr=$(echo $resp | jq .status_reason)
+          props=$(echo $resp | jq .properties)
+        fi
+
+        echo -e "\n--- Store KV DBAPI Response ---"
+        echo "RG ID: $rgid"
+        echo "Component Name: $compname"
+        echo "Component Type Code: $comptype"
+        echo "Status: $status"
+        echo "Status Reason: $statusr"
+        echo "Properties: $props"
+        echo "------"
+
+        echo "response=$resp" >> $GITHUB_OUTPUT
+        echo "rgid=$rgid" >> $GITHUB_OUTPUT
+        echo "compname=$compname" >> $GITHUB_OUTPUT
+        echo "comptype=$comptype" >> $GITHUB_OUTPUT
+        echo "status=$status" >> $GITHUB_OUTPUT
+        echo "statusr=$statusr" >> $GITHUB_OUTPUT
+        echo "props="$props"" >> $GITHUB_OUTPUT
+        echo "dbstatus=$dbstatus" >> $GITHUB_OUTPUT
+        echo "=== End apiresp Step ==="
+
+    - name: Print Outputs
+      id: printout
+      run: |
+        echo "=== Begin printout Step ==="
+        rgn=${{ steps.buildkv.outputs.resourceGroupName }}
+        kvnm=${{ steps.buildkv.outputs.keyVaultName }}
+        echo "Resource Group: $rgn"
+        echo "Keyvault Name: $kvnm"
+
+        if [[ -z $rgn ]] 
+        then
+          errtext="BUILD ERROR: Missing Resource Group Name"
+          echo $errtext
+          echo "ERRCODE=211" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+        fi
+
+        if [[ -z $kvnm ]] 
+        then
+          errtext="BUILD ERROR: Missing Keyvault Name"
+          echo $errtext
+          echo "ERRCODE=212" >> $GITHUB_ENV
+          echo "ERRTEXT=$errtext" >> $GITHUB_ENV
+        fi
+
+        echo "=== End printout Step ==="

@@ -1,0 +1,358 @@
+name: 'mgha: KeyVault Creator'
+# This action is meant to ONLY be called from orion-platform-api calls
+
+on:
+  workflow_call:
+    inputs:
+      rgname:
+        description: 'RG Name'
+        required: true
+        type: string                       
+      kvname:
+        description: 'Keyvault Name'
+        required: false
+        type: string
+      kvtype:
+        description: 'KV Type'
+        required: true
+        type: string     
+      aaid:
+        description: 'AA ID'
+        required: true
+        type: string  
+    outputs:
+      rgname: 
+        value: ${{ jobs.setup-job.outputs.rgname }}      
+      kvname: 
+        value: ${{ jobs.setup-job.outputs.kvname }}
+      kvtype: 
+        value: ${{ jobs.setup-job.outputs.kvtype }}
+      errcode: 
+        value: ${{ jobs.setup-job.outputs.errcode }}
+      errtext: 
+        value: ${{ jobs.setup-job.outputs.errtext }} 
+      dbapistatus: 
+        value: ${{ jobs.setup-job.outputs.dbapistatus }} 
+
+jobs:
+  setup-job:
+    defaults:
+      run:
+        shell: bash
+        working-directory: './provision/bicep/keyvault/'
+    runs-on: ubuntu-latest
+    name: Setup Job
+    environment: production
+    env:
+      rgname: ${{ inputs.rgname }}
+      kvname: ${{ inputs.kvname }}
+      kvtype: ${{ inputs.kvtype }}
+      aaid: ${{ inputs.aaid }}
+      errcode: 0
+      errtext: "No Errors"   
+    outputs:
+      rgname: ${{ steps.finalize.outputs.rgname }}      
+      kvname: ${{ steps.finalize.outputs.kvname }}
+      kvtype: ${{ steps.finalize.outputs.kvtype }}
+      errcode: ${{ steps.finalize.outputs.errcode }}
+      errtext: ${{ steps.finalize.outputs.errtext }} 
+      dbapistatus: ${{ steps.finalize.outputs.dbapistatus }}      
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Store KVName in DB (Deploying)
+      id: storekvdep
+      continue-on-error: true
+      uses: ./.github/actions/orion-api
+      with:
+        apigee_url: ${{ secrets.APIGEE_TOKEN_URL }}
+        apigee_client_id: ${{ secrets.APIGEE_CLIENT_ID }}
+        apigee_client_secret: ${{ secrets.APIGEE_CLIENT_SECRET }}
+        api_url: ${{ secrets.API_URL }}
+        api_suffix: '/api/v2/appcodes/components'
+        method: 'POST' 
+        body: '{"resource_group_name": "${{ env.rgname }}","name": "${{ env.kvname }}","component_type_code": "KV","status": "DEPLOYING", "creator_id": "${{ env.aaid }}" }'
+        environment: 'P'
+        attempt_limit: 5
+
+    - name: Log into Azure
+      id: azurelogin
+      uses: azure/login@v1
+      with:
+        creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ vars.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ vars.AZURE_TENANT_ID }}"}'
+        enable-AzPSSession: true
+
+    - name: 'Setup Workflow and Validate Variables'
+      id: buildkv
+      shell: pwsh
+      run: |
+        Write-Output "=== Begin buildkv ==="
+        $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss TZ: K"
+        Write-Output "Start Date: $now"
+        Write-Output "Current Directory: $((Get-Location).Path)"
+
+        # Get inputs from caller
+        $rgname = "${{ env.rgname }}"
+        $rgname = $rgname.ToLower()
+        Write-Output "RG Name: $rgname"  
+
+        # parse rgname for values
+        If ($null -eq $rgname) {
+          $errtext = "ERROR: Missing RG Name from caller: - aborting"
+          Write-Output $errtext
+          echo "errcode=101A" >> $env:GITHUB_ENV
+          echo "errtext=$errtext" >> $env:GITHUB_ENV
+          exit 1
+        }
+        Else {
+          If ($rgname.Contains("ba-n-")) {
+            $spoke = "aa-ba-nonprod-spoke"
+            $spokeenv = "N"
+          }
+          ElseIf ($rgname.Contains("ba-p-")) {
+            $spoke = "aa-ba-prod-spoke"
+            $spokeenv = "P"
+          }
+          Else {
+            $errtext = "ERROR: Bad RG Name from caller; cannot determine Subscription from name: - aborting"
+            Write-Output $errtext
+            echo "errcode=101B" >> $env:GITHUB_ENV
+            echo "errtext=$errtext" >> $env:GITHUB_ENV
+            exit 1
+          }
+        }
+
+        # kvname and kvtype reference
+        $kvname = "${{ env.kvname }}"
+        $kvtype = "${{ env.kvtype }}"
+
+        $appname = ($rgname -Split "-")[-2]
+        $appname = $appname.ToUpper()
+        Write-Output "App Name: $($appname)"
+
+        If ($kvname.Length -eq 0) {
+            If ($kvtype -eq "RG") {
+            $kvname = $rgname.Substring(0, ($rgname.Length - 2)) + "kv"
+            }
+            ElseIf ($kvtype -eq "AAID") {
+            $kvname = $rgname.Substring(0,11) + $aaid + "-kv"
+            }
+            ElseIf ($kvtype -eq "ML") {
+            $kvname = $rgname.Substring(0, ($rgname.Length - 2)) + "ml-kv"
+            }
+        }
+        
+        Write-Output "KV Name: $($kvname)"
+
+        If ($kvname.Length -gt 24) {
+            $errtext = "ERROR: Bad KV Name $($kvname); cannot be greather than 24 characters: - aborting"
+            Write-Output $errtext
+            echo "errcode=101C" >> $env:GITHUB_ENV
+            echo "errtext=$errtext" >> $env:GITHUB_ENV
+            exit 1
+        }
+        
+        $aaid = "${{ env.aaid }}"
+
+        If ($kvtype -eq "AAID" -and $aaid.Length -eq 0) {
+            $errtext = "ERROR: Bad AAID $($aaid) - aborting"
+            Write-Output $errtext
+            echo "errcode=101D" >> $env:GITHUB_ENV
+            echo "errtext=$errtext" >> $env:GITHUB_ENV
+            exit 1
+        }
+
+        Write-Output "`nUsing the following values:"
+        Write-Output "`tSpoke:`t$($spoke)"
+        Write-Output "`tRG Name:`t$($rgname)"
+        Write-Output "`tKV Name:`t$($kvname)"
+        Write-Output "`tKV Type:`t$($kvtype)"
+        Write-Output "`tAAID:`t$($aaid)"
+        $dname = "KV-" + $(Get-Date -UFormat '%Y%b%d%H%M%S')
+        $template = "./provision/bicep/keyvault/main.bicep"
+        Write-Output "`tDeployment Name:`t$($dname)"
+
+        $subscription = (az account show | ConvertFrom-Json).name
+        Write-Output "`nCurrent Subscription: $($subscription)"
+        $retry = 5
+        $loop = 0
+
+        Do {
+          $loop = $loop + 1
+          Write-Output "### Attempt #$($loop) to switch to subscription $($spoke)"
+          az account set -n $spoke
+          $subscription = (az account show | ConvertFrom-Json).name
+          Write-Output "Current Subscription: $($subscription)"
+        } While ($subscription -ne $spoke -and $loop -le $retry )       
+
+        If ($subscription -ne $spoke ) {
+          $errtext = "ERROR: Error switching to $($spoke)"
+          Write-Output $errtext
+          echo "errcode=301" >> $env:GITHUB_ENV
+          echo "errtext=$errtext" >> $env:GITHUB_ENV 
+          exit 1
+        }       
+
+        # Build Key Vault Core
+        Write-Output "Subscription: $($subscription)"
+        Write-Output "==============="
+        Write-Output "`nAbout to execute Bicep: "
+        $command = "az deployment group create --name $dname -g $rgname -f main.bicep -p keyVaultName=$kvname"
+        Write-Output $command
+        $result = Invoke-Expression $command -EA SilentlyContinue -EV biceperr
+        Write-Output "`n--- Result JSON ---"
+        Write-Output $result
+        Write-Output "------"
+
+        If ($null -eq $result) {
+          $errtext = "ERROR: Bicep had an unknown error building the keyvault; result is empty"
+          Write-Output $biceperr
+          echo "errcode=201" >> $env:GITHUB_ENV
+          echo "errtext=$biceperr" >> $env:GITHUB_ENV
+          $kvnameout = "N/A"
+          dbapistatus = "FAILED"
+        }
+        Else {
+          $resulttab = $result | ConvertFrom-Json
+          Write-Output "`n--- Create Key Vault Result Tablular ---"
+          Write-Output $resulttab
+          Write-Output "------"
+          $kvnameout = $resulttab.properties.outputs.keyVaultName.value
+        }
+
+        Write-Output "-------"
+        Write-Output "`nBICEP ERR.TXT"
+
+        If ($null -eq $biceperr -or $biceperr -ne ""){
+          Write-Output $biceperr
+          echo "errcode=202" >> $env:GITHUB_ENV
+          echo "errtext=$biceperr" >> $env:GITHUB_ENV
+          $dbapistatus = "FAILED"
+        } 
+        Else {
+          Write-Output "`tNo Errors Found"
+          $dbapistatus = "SUCCESS"
+        }
+
+        Write-Output "------"
+        Write-Output "`nDBAPI STATUS: $dbapistatus"
+        echo "dbapistatus=$dbapistatus" >> $env:GITHUB_OUTPUT
+
+        # Add Access Policies per KV Type
+        Write-Output "`n--- Adding KV Access Policies ---"
+
+        If ($kvtype -eq "RG") {
+          $prefix = "AAD_BA_RG_" + $($appname).ToUpper()
+
+          $aadgrpown = $prefix + "_OWNER_" + $($spokeenv).ToUpper()
+          Write-Output "- Adding $($aadgrpown)"
+          $objidown = $(az ad group show --group $aadgrpown --query id --out tsv)
+
+          If ($objidown.Length -eq 0) {
+            Write-Output "ERROR: Could not add AAD Group $($aadgrpown) does not exist"
+          }
+          Else {
+            $result = (az keyvault set-policy --name $kvname --object-id $objidown --secret-permissions all purge --key-permissions all purge --certificate-permissions all purge)
+            
+            If ($result.name -ne $aadgrpown) {
+              Write-Output "+++ ERROR: Could not add $($aadgrpown) to $($kvname)"
+            }
+          }
+
+          $aadgrpctb = $prefix + "_CONTRIBUTOR_" + $($spokeenv).ToUpper()
+          Write-Output "- Adding $($aadgrpctb)"
+          $objidctb = $(az ad group show --group $aadgrpctb --query id --out tsv)
+
+          If ($objidctb.Length -eq 0) {
+            Write-Output "ERROR: Could not add AAD Group $($aadgrpctb) does not exist"
+          }
+          Else {
+            $result = (az keyvault set-policy --name $kvname --object-id $objidctb --secret-permissions all --key-permissions all --certificate-permissions all | ConvertFrom-Json)
+
+            If ($result.name -ne $aadgrpctb) {
+            Write-Output "+++ ERROR: Could not add $($aadgrpctb) to $($kvname)"
+            }
+          }
+
+          $aadgrprdp = $prefix + "_READER+_" + $($spokeenv).ToUpper()
+          Write-Output "- Adding $($aadgrprdp)"
+          $objidrdp = $(az ad group show --group $aadgrprdp --query id --out tsv)
+          
+          If ($objidrdp.Length -eq 0) {
+            Write-Output "ERROR: Could not add AAD Group $($aadgrprdp) does not exist"
+          }
+          Else {
+            $result = (az keyvault set-policy --name $kvname --object-id $objidrdp --secret-permissions all --key-permissions all --certificate-permissions all | ConvertFrom-Json)
+
+            If ($result.name -ne $objidrdp) {
+            Write-Output "+++ ERROR: Could not add $($objidrdp) to $($kvname)"
+            }
+          }
+
+          $spn = (az ad sp list --display-name "ba-p-cicdautomation-sp" | ConvertFrom-Json)
+          $spnname = $spn.displayName
+          Write-Output "- Adding $($spnname)"
+          $objidspn = $spn.id
+
+          If($objidspn.Length -eq 0){
+            Write-Output "ERROR: Could not add SPN $($objidspn) does not exist
+          }
+          Else{
+            $result = (az keyvault set-policy --name $kvname --object-id $objidspn --secret-permissions all purge --key-permissions all purge --certificate-permissions all purge | ConvertFrom-Json)   
+
+            If ($result.name -ne $spnname) {
+            Write-Output "+++ ERROR: Could not add $($spnname) to $($kvname)"
+          }
+        }
+        }
+        ElseIf ($kvtype -eq "AAID") {
+          Write-Output "- Adding $($aaid)"
+          $objidown = $(az ad group show --group $aadgrpown --query id --out tsv)
+          $result = (az keyvault set-policy --name $kvname --object-id $objidown --secret-permissions all purge --key-permissions all purge --certificate-permissions all purge)
+        }
+        ElseIf ($kvtype -eq "AML") {
+          Write-Output "AML: No Access Policies to Add for KV Type: $($kvtype)"
+        }
+        Else {
+          Write-Output "N/A: No Access Policies to Add for KV Type: $($kvtype)"
+        }
+
+        Write-Output "=== End Buildkv ==="
+   
+    - name: Store KVName in DB (Final)
+      id: storekvfinal
+      continue-on-error: true
+      uses: ./.github/actions/orion-api
+      with:
+        apigee_url: ${{ secrets.APIGEE_TOKEN_URL }}
+        apigee_client_id: ${{ secrets.APIGEE_CLIENT_ID }}
+        apigee_client_secret: ${{ secrets.APIGEE_CLIENT_SECRET }}
+        api_url: ${{ secrets.API_URL }}
+        api_suffix: '/api/v2/appcodes/components'
+        method: 'POST' 
+        body: '{"resource_group_name": "${{ env.rgname }}","name": "${{ env.kvname }}","component_type_code": "KV","status": "${{ steps.buildkv.outputs.dbapistatus }}", "creator_id": "${{ env.aaid }}" }'
+        environment: 'P'
+        attempt_limit: 5
+
+    - name: Finalize Outputs
+      id: finalize   
+      run: |  
+        errcode="${{ env.errcode }}"
+        echo "errcode=$errcode"
+        echo "errcode=$errcode" >> $GITHUB_OUTPUT
+        errtext="${{ env.errtext }}"
+        echo "errtext=$errtext"
+        echo "errtext=$errtext" >> $GITHUB_OUTPUT
+        rgname="${{ env.rgname }}"
+        echo "rgname=$rgname"
+        echo "rgname=$rgname" >> $GITHUB_OUTPUT
+        kvname="${{ env.kvname }}"
+        echo "kvname=$kvname"
+        echo "kvname=$kvname" >> $GITHUB_OUTPUT
+        kvtype="${{ env.kvtype }}"
+        echo "kvtype=$kvtype"
+        echo "kvtype=$kvtype" >> $GITHUB_OUTPUT
+        dbapistatus=${{ steps.buildkv.outputs.dbapistatus }}
+        echo "dbapistatus=$dbapistatus"
+        echo "dbapistatus=$dbapistatus" >> $GITHUB_OUTPUT
